@@ -1,0 +1,6 @@
+# LF in the repository, native in the working tree. Developed on macOS and
+# Windows; without this every rewritten file shows up as a whole-file diff.
+* text=auto eol=lf
+
+# cmd.exe misparses labels and blocks in LF-only batch files
+*.cmd text eol=crlf
