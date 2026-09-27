@@ -6,15 +6,21 @@
 // as a MIDI keyboard.
 //
 //   aux left     octave down
-//   aux middle   next layout
+//   aux middle   tap: next layout; hold: pick the key (C major, A minor, ...)
 //   aux right    octave up
 //
-// No combos: the dock only sees one key at a time, aux buttons included.
+// With the rollover firmware (streamdock-m18-firmware) several keys can be held
+// at once, with one hardware limit: while a key is held, the keys ABOVE it in
+// the same column often don't register (no diodes in the matrix). So every
+// layout below puts things you play together side by side, and stacks things
+// you'd never want at the same time, like two neighbouring notes. On the stock
+// firmware it all still works, one key at a time.
 //
 // Usage:
 //   npm run dockd                 (in streamdock-m18, owns the device)
 //   npm start                     (this, sends to the port named "StreamDock";
 //                                  on macOS/Linux it creates that port itself)
+//   npm start -- --key=Eb         (start in another key; --key=Am for A minor)
 //   npm start -- --port=wavetable (any substring of an output port name)
 //   npm run ports                 (list output ports)
 //
@@ -32,91 +38,233 @@ const DOCKD_PORT = Number(args.dockd ?? 5548);
 const VELOCITY = Number(args.velocity ?? 100);
 
 const AUX_LEFT = 15, AUX_MIDDLE = 16, AUX_RIGHT = 17;
+const HOLD_MS = 500;   // aux middle held this long opens the key picker
+
+// ---- keys and scales --------------------------------------------------------
+//
+// A key is a home note plus major or minor. Every layout except the drums
+// follows it, so picking "A minor" changes the chords, the scale and the
+// pentatonic together.
+
+const MODES = {
+  // steps: semitones above the home note for the 7 notes of the scale.
+  // pent: which of those 7 make the 5-note pentatonic scale.
+  // names: how each home note is usually written in this mode (Db major but
+  // C# minor), which decides whether the key is spelled with sharps or flats.
+  major: {
+    steps: [0, 2, 4, 5, 7, 9, 11], pent: [0, 1, 2, 4, 5],
+    names: ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'],
+  },
+  minor: {
+    steps: [0, 2, 3, 5, 7, 8, 10], pent: [0, 2, 3, 4, 6],
+    names: ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'G#', 'A', 'Bb', 'B'],
+  },
+};
+
+const LETTERS = 'CDEFGAB';
+const NATURAL = [0, 2, 4, 5, 7, 9, 11];   // semitones of C D E F G A B
+const BLACK = [1, 3, 6, 8, 10];           // the black piano keys
+
+const state = { layout: 0, key: 0, minor: false, octave: 3, picker: false };
+
+const mode = () => MODES[state.minor ? 'minor' : 'major'];
+const keyName = (key = state.key, minor = state.minor) =>
+  MODES[minor ? 'minor' : 'major'].names[key] + (minor ? ' minor' : ' major');
+const rootNote = () => 12 * (state.octave + 1) + state.key;
+
+// Spells a note the way sheet music would in this key: in F major the fourth
+// note is Bb, not A#, because each scale note gets its own letter.
+function spell(note, degree) {
+  const letter = (LETTERS.indexOf(mode().names[state.key][0]) + degree) % 7;
+  const acc = ((note - NATURAL[letter]) % 12 + 18) % 12 - 6;   // -2 .. +2
+  return {
+    name: LETTERS[letter] + (acc > 0 ? '#'.repeat(acc) : 'b'.repeat(-acc)),
+    octave: Math.floor((note - acc) / 12) - 1,
+  };
+}
+
+// Notes outside the key: flats in flat keys, sharps otherwise.
+function spellOutside(note) {
+  const flats = mode().steps.some((s, d) => spell(state.key + s, d).name.includes('b'));
+  const names = flats
+    ? ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
+    : ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  return { name: names[note % 12], octave: Math.floor(note / 12) - 1 };
+}
+
+// Step s of the scale, counting on past the octave: 0 is the home note, 7 the
+// home note an octave up.
+function scaleNote(step) {
+  const degree = step % 7;
+  const note = rootNote() + 12 * Math.floor(step / 7) + mode().steps[degree];
+  return { note, degree, ...spell(note, degree) };
+}
+
+// ---- chords -----------------------------------------------------------------
+//
+// The chord on a scale note is that note plus the ones two and four scale
+// steps up (every other note). Which of them are 3 or 4 semitones apart
+// decides major, minor or diminished. Roman numerals give the chord's place
+// in the key: upper case major, lower case minor, ° diminished.
+
+const ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'];
+
+// What each chord does in the key, by scale degree: home, away, or tension
+// that wants to go home. The same holds in minor (i, III and VI are home).
+const FUNCTION = ['tonic', 'sub', 'tonic', 'sub', 'dominant', 'tonic', 'dominant'];
+const FUNCTION_COLOR = { tonic: '#1d3f6e', sub: '#1f5a34', dominant: '#6e1d1d' };
+
+function chord(step) {
+  const [root, third, fifth] = [0, 2, 4].map(i => scaleNote(step + i));
+  const quality = third.note - root.note === 4 ? 'maj'
+    : fifth.note - root.note === 6 ? 'dim' : 'min';
+  const roman = quality === 'maj' ? ROMAN[root.degree]
+    : ROMAN[root.degree].toLowerCase() + (quality === 'dim' ? '°' : '');
+  const suffix = { maj: '', min: 'm', dim: 'dim' }[quality];
+  return { notes: [root.note, third.note, fifth.note], roman, name: root.name + suffix, degree: root.degree, octave: root.octave };
+}
 
 // ---- layouts ----------------------------------------------------------------
 //
-// Grid index 0 is top-left. Scale layouts run like a pad controller: lowest
-// note bottom-left, rising left to right, then up a row.
+// Grid index 0 is top-left; below, `col` counts from the left and `row` from
+// the bottom. Pitch rises from bottom-left.
+//
+// The column limit shapes all of them. Keys stacked in one column are things
+// that clash (neighbouring notes, neighbouring chords, two hi-hats), so losing
+// the upper one while the lower is held costs nothing musical. Keys side by
+// side never interfere, and that is where the combinations live.
 
-const SCALES = {
-  'Minor Pent': [0, 3, 5, 7, 10],
-  'Minor': [0, 2, 3, 5, 7, 8, 10],
-  'Major': [0, 2, 4, 5, 7, 9, 11],
-  'Chromatic': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-};
-
-// General MIDI percussion, channel 10. Cymbals on top, toms in the middle,
-// kick and snare along the bottom where your thumbs are.
+// General MIDI percussion, channel 10, top row first. One column per drum
+// group, so what you hit together (kick, snare, hi-hat, crash) sits side by
+// side, and a column only holds variants you'd hit one at a time.
 const DRUMS = [
-  [49, 'Crash'], [57, 'Crash2'], [55, 'Splash'], [51, 'Ride'], [53, 'Bell'],
-  [42, 'HH Cl'], [46, 'HH Op'], [50, 'Tom Hi'], [47, 'Tom Md'], [45, 'Tom Lo'],
-  [36, 'Kick'], [38, 'Snare'], [40, 'Snr 2'], [39, 'Clap'], [37, 'Rim'],
+  [56, 'Cow bell'], [37, 'Rim'], [50, 'Tom Hi'], [44, 'HH Ped'], [53, 'Bell'],
+  [35, 'Kick 2'], [39, 'Clap'], [47, 'Tom Md'], [46, 'HH Op'], [51, 'Ride'],
+  [36, 'Kick'], [38, 'Snare'], [45, 'Tom Lo'], [42, 'HH Cl'], [49, 'Crash'],
 ];
 
-// The dock reports one key at a time (PROTOCOL.md, "One key at a time"), so
-// chords have to come from a single press. Each column is one chord of the
-// major key; going up a column changes its flavour, not which chord it is.
-// Every chord is diatonic, so any order of presses sounds right together.
-const CHORD_DEGREES = [
-  // [semitones above the key, triad, seventh]
-  [0, 'maj', 'maj7'],   // I
-  [5, 'maj', 'maj7'],   // IV
-  [7, 'maj', '7'],      // V
-  [9, 'min', 'min7'],   // vi
-  [2, 'min', 'min7'],   // ii
-];
-
-const CHORD_SHAPES = {
-  maj: [0, 4, 7], min: [0, 3, 7],
-  maj7: [0, 4, 7, 11], 7: [0, 4, 7, 10], min7: [0, 3, 7, 10],
-  power: [0, 7, 12],
-};
-
-const CHORD_SUFFIX = { maj: '', min: 'm', maj7: 'maj7', 7: '7', min7: 'm7', power: '5' };
+const GREY = { color: '#b0b0b0', textColor: '#000000' };   // the home note or chord
 
 const LAYOUTS = [
-  { name: 'Chords', chords: true, channel: 0, color: '#3a1d4f', ring: [180, 40, 200] },
-  { name: 'Drums', drums: true, channel: 9, color: '#5a1d1d', ring: [200, 40, 20] },
-  ...Object.entries(SCALES).map(([name, steps], i) => ({
-    name, steps, channel: 0,
-    color: ['#1d3557', '#2d1d57', '#1d4f3a', '#4a3a1d'][i],
-    ring: [[30, 80, 220], [110, 40, 220], [20, 180, 90], [220, 150, 20]][i],
-  })),
+  {
+    // Count up each column: I ii iii, IV V vi, vii° I ii, and so on, two
+    // octaves' worth, so every chord is there low and high and none repeats
+    // at the same pitch. Stacked chords are a step apart and share no notes,
+    // the clashing kind; the four chords of pop (I V vi IV) sit in the first
+    // two columns.
+    name: 'Chords', channel: 0, ring: [180, 40, 200],
+    face(col, row) {
+      const c = chord(3 * col + row);
+      const look = c.degree === 0 ? GREY : { color: FUNCTION_COLOR[FUNCTION[c.degree]], textColor: '#ffffff' };
+      // a third line for the octave where dockd can draw one
+      const label = multiline ? [c.roman, c.name, `oct ${c.octave}`].join('\n') : `${c.roman} ${c.name}`;
+      return { notes: c.notes, label, ...look };
+    },
+  },
+  {
+    // Rows climb in thirds (every other scale note), and each row starts one
+    // note above the row below. So any three keys side by side are a chord,
+    // and each column is three neighbouring notes, the ones that clash.
+    // A scale run zigzags: up the column, then on to the next column.
+    name: 'Scale', channel: 0, ring: [30, 80, 220],
+    face(col, row) {
+      const n = scaleNote(2 * col + row);
+      // home note grey; the other notes of the home chord (3rd and 5th) a
+      // brighter blue, since a tune usually comes to rest on one of those
+      const look = n.degree === 0 ? GREY
+        : { color: n.degree === 2 || n.degree === 4 ? '#35609a' : '#1d3557', textColor: '#ffffff' };
+      return { notes: [n.note], label: n.name + n.octave, ...look };
+    },
+  },
+  {
+    // Five notes per octave, one octave per row, so each column is one note
+    // in three octaves. The pentatonic scale has no clashing neighbours,
+    // which is why any combination sounds fine.
+    name: 'Pentatonic', channel: 0, ring: [20, 180, 90],
+    face(col, row) {
+      const n = scaleNote(7 * row + mode().pent[col]);
+      const look = n.degree === 0 ? GREY : { color: '#1d4f3a', textColor: '#ffffff' };
+      return { notes: [n.note], label: n.name + n.octave, ...look };
+    },
+  },
+  {
+    // All 12 notes, three semitones per column: each column is three
+    // neighbouring piano keys, and any two notes at least three semitones
+    // apart are in different columns, so every chord fits. Notes outside the
+    // key are dark.
+    name: 'Chromatic', channel: 0, ring: [220, 150, 20],
+    face(col, row) {
+      const semis = 3 * col + row;
+      const note = rootNote() + semis;
+      const degree = mode().steps.indexOf(semis % 12);
+      const n = degree < 0 ? spellOutside(note) : spell(note, degree);
+      const look = degree === 0 ? GREY
+        : degree > 0 ? { color: '#4a3a1d', textColor: '#ffffff' }
+        : { color: '#141414', textColor: '#707070' };
+      return { notes: [note], label: n.name + n.octave, ...look };
+    },
+  },
+  {
+    name: 'Drums', channel: 9, drums: true, ring: [200, 40, 20],
+    face(col, row, index) {
+      const [note, label] = DRUMS[index];
+      return { notes: [note], label, color: '#5a1d1d', textColor: '#ffffff' };
+    },
+  },
 ];
 
-const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-const noteName = n => NOTE_NAMES[n % 12] + (Math.floor(n / 12) - 1);
-
-const state = { layout: 0, root: 48 /* C3 */ };
-
-// What a key plays: one or more MIDI notes, plus its label.
-function keyToNotes(index) {
-  const layout = LAYOUTS[state.layout];
+// What a key plays and how it looks.
+function keyFace(index) {
   const cols = 5, rows = 3;
   const col = index % cols;
   const row = rows - 1 - Math.floor(index / cols);   // 0 = bottom row
-
-  if (layout.drums) return { notes: [DRUMS[index][0]], label: DRUMS[index][1], root: false };
-
-  if (layout.chords) {
-    // bottom: plain chords, middle: sevenths, top: rock power chords
-    const [offset, triad, seventh] = CHORD_DEGREES[col];
-    const shape = [triad, seventh, 'power'][row];
-    const base = state.root + offset;
-    return {
-      notes: CHORD_SHAPES[shape].map(n => base + n),
-      // the space wraps onto a second line; without the octave, octave up
-      // and down would repaint identical labels
-      label: NOTE_NAMES[base % 12] + CHORD_SUFFIX[shape] + ' ' + noteName(base),
-      root: col === 0,
-    };
-  }
-
-  const step = row * cols + col;
-  const { steps } = layout;
-  const note = state.root + 12 * Math.floor(step / steps.length) + steps[step % steps.length];
-  return { notes: [note], label: noteName(note), root: step % steps.length === 0 };
+  return LAYOUTS[state.layout].face(col, row, index);
 }
+
+// ---- key picker ---------------------------------------------------------------
+//
+// Hold aux middle to open it, tap aux middle to close it. The 12 home notes in
+// piano order (black keys dark), then major, minor, and the relative key:
+// C major and A minor use the same seven notes, just with a different home.
+
+const relative = () => state.minor
+  ? { key: (state.key + 3) % 12, minor: false }
+  : { key: (state.key + 9) % 12, minor: true };
+
+function pickerFace(index) {
+  const on = { color: '#e0b020', textColor: '#000000' };
+  const off = { color: '#303030', textColor: '#ffffff' };
+  if (index < 12) {
+    const look = index === state.key ? on
+      : BLACK.includes(index) ? { color: '#202020', textColor: '#ffffff' }
+      : { color: '#d0d0d0', textColor: '#000000' };
+    return { label: mode().names[index], ...look };
+  }
+  if (index === 12) return { label: 'major', ...(state.minor ? off : on) };
+  if (index === 13) return { label: 'minor', ...(state.minor ? on : off) };
+  const r = relative();
+  return { label: `rel. ${MODES[r.minor ? 'minor' : 'major'].names[r.key]}${r.minor ? 'm' : ''}`, ...off };
+}
+
+function pick(index) {
+  if (index < 12) state.key = index;
+  else if (index === 12) state.minor = false;
+  else if (index === 13) state.minor = true;
+  else Object.assign(state, relative());
+  console.log(`key: ${keyName()}`);
+  paint();
+}
+
+// --key=Eb, --key=F#m, --key=A --minor
+function parseKey(text, minor) {
+  const m = /^([a-g])([#b]?)(m?)$/i.exec(String(text));
+  if (!m) { console.error(`--key: can't read "${text}", staying in C major`); return; }
+  const pc = (NATURAL[LETTERS.indexOf(m[1].toUpperCase())] + (m[2] === '#' ? 1 : m[2] === 'b' ? 11 : 0)) % 12;
+  state.key = pc;
+  state.minor = Boolean(m[3]) || Boolean(minor);
+}
+if (args.key !== undefined) parseKey(args.key, args.minor);
+else if (args.minor) state.minor = true;
 
 // ---- MIDI -------------------------------------------------------------------
 
@@ -146,12 +294,12 @@ if (process.platform !== 'win32' && args.port === undefined) {
   console.log(`MIDI out: ${ports[portIndex]}`);
 }
 
-// Remember what each key actually sent, so a release after an octave change
-// still turns off the right notes.
+// Remember what each key actually sent, so a release after an octave or key
+// change still turns off the right notes.
 const held = new Map();   // key index -> { notes, channel }
 
 function noteOn(index) {
-  const notes = keyToNotes(index).notes.filter(n => n >= 0 && n <= 127);
+  const notes = keyFace(index).notes.filter(n => n >= 0 && n <= 127);
   const { channel } = LAYOUTS[state.layout];
   for (const n of notes) out.sendMessage([0x90 | channel, n, VELOCITY]);
   held.set(index, { notes, channel });
@@ -172,34 +320,38 @@ function allNotesOff() {
 
 let sock = null;
 let device = null;
+let multiline = false;   // dockd draws "\n" in labels as lines (hello.features)
 const send = o => sock?.writable && sock.write(JSON.stringify(o) + '\n');
 
 function paint() {
   if (!device || device.state !== 'online') return;
-  const layout = LAYOUTS[state.layout];
   for (let i = 0; i < device.keys; i++) {
-    const { label, root } = keyToNotes(i);
-    send({ cmd: 'key', index: i, label, color: root ? '#b0b0b0' : layout.color,
-      textColor: root ? '#000000' : '#ffffff' });
+    const { label, color, textColor } = state.picker ? pickerFace(i) : keyFace(i);
+    send({ cmd: 'key', index: i, label, color, textColor });
   }
   paintLeds(false);
 }
 
 function paintLeds(hit) {
-  const { ring } = LAYOUTS[state.layout];
+  const ring = state.picker ? [224, 176, 32] : LAYOUTS[state.layout].ring;
   send({ cmd: 'led', zone: 'ring', color: hit ? [255, 255, 255] : ring });
   send({ cmd: 'led', zone: 'front', color: hit ? [255, 255, 255] : ring.map(c => c >> 2) });
 }
 
 function announce() {
   const layout = LAYOUTS[state.layout];
-  const where = layout.drums ? '' : ` from ${noteName(state.root)}`;
+  const where = layout.drums ? '' : `, ${keyName()}, octave ${state.octave}`;
   console.log(`layout: ${layout.name}${where}`);
 }
 
+let middleTimer = null;
+let middleHeld = false;   // true once the hold opened or closed the picker
+
 function onKey({ index, state: down }) {
   if (index < AUX_LEFT) {
-    if (down) {
+    if (state.picker) {
+      if (down) pick(index);
+    } else if (down) {
       noteOn(index);
       if (held.size === 1) paintLeds(true);
     } else {
@@ -209,19 +361,30 @@ function onKey({ index, state: down }) {
     return;
   }
 
-  if (!down) return;
-
   if (index === AUX_MIDDLE) {
-    state.layout = (state.layout + 1) % LAYOUTS.length;
-    announce();
-    paint();
+    if (down) {
+      middleHeld = false;
+      middleTimer = setTimeout(() => {
+        middleHeld = true;
+        state.picker = !state.picker;
+        if (!state.picker) announce();
+        paint();
+      }, HOLD_MS);
+    } else {
+      clearTimeout(middleTimer);
+      if (middleHeld) return;
+      if (state.picker) state.picker = false;
+      else state.layout = (state.layout + 1) % LAYOUTS.length;
+      announce();
+      paint();
+    }
     return;
   }
 
-  if (LAYOUTS[state.layout].drums) return;
-  const next = state.root + (index === AUX_LEFT ? -12 : 12);
-  if (next < 0 || next > 108) return;
-  state.root = next;
+  if (!down || state.picker || LAYOUTS[state.layout].drums) return;
+  const next = state.octave + (index === AUX_LEFT ? -1 : 1);
+  if (next < 0 || next > 7) return;
+  state.octave = next;
   announce();
   paint();
 }
@@ -244,6 +407,7 @@ function connect() {
       switch (msg.type) {
         case 'hello':
           device = msg;
+          multiline = (msg.features ?? []).includes('multilineLabels');
           if (msg.state === 'online') { announce(); paint(); }
           else console.log('dockd is up, waiting for the dock to be plugged in');
           break;
