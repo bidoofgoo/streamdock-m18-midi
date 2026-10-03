@@ -83,13 +83,13 @@ function spell(note, degree) {
   };
 }
 
+const SHARPS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const FLATS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'];
+
 // Notes outside the key: flats in flat keys, sharps otherwise.
 function spellOutside(note) {
   const flats = mode().steps.some((s, d) => spell(state.key + s, d).name.includes('b'));
-  const names = flats
-    ? ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
-    : ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-  return { name: names[note % 12], octave: Math.floor(note / 12) - 1 };
+  return { name: (flats ? FLATS : SHARPS)[note % 12], octave: Math.floor(note / 12) - 1 };
 }
 
 // Step s of the scale, counting on past the octave: 0 is the home note, 7 the
@@ -238,7 +238,10 @@ function pickerFace(index) {
     const look = index === state.key ? on
       : BLACK.includes(index) ? { color: '#202020', textColor: '#ffffff' }
       : { color: '#d0d0d0', textColor: '#000000' };
-    return { label: mode().names[index], ...look };
+    // a black key has two names; the one this key is spelled with goes on top
+    const name = mode().names[index];
+    const other = name === SHARPS[index] ? FLATS[index] : SHARPS[index];
+    return { label: name === other ? name : `${name} ${other}`, ...look };
   }
   if (index === 12) return { label: 'major', ...(state.minor ? off : on) };
   if (index === 13) return { label: 'minor', ...(state.minor ? on : off) };

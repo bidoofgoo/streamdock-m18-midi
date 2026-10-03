@@ -123,6 +123,10 @@ Most songs wander from home to away to tension and back home.
 in piano order (black piano keys dark), then **major** and **minor**. Tap one or two, then tap
 aux middle to go back. Chords, Scale, Pentatonic and Chromatic all follow.
 
+A black piano key has two names: C# and Db are the same key. The picker shows both. The top one
+is the name that needs the fewest sharps or flats in the chosen key, and the dock spells the key
+with it. That is why the names swap places between major and minor.
+
 The last key, **rel.**, jumps to the **relative** key. C major and A minor use exactly the same
 seven notes; only the home differs. So minor isn't a different set of notes so much as a
 different place to call home.
